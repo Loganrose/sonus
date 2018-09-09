@@ -14,6 +14,6 @@ module.exports = watson => {
 
     return {
         isSocket,
-        streamingRecognize: () => watson.createRecognizeStream(config)
+        streamingRecognize: () => watson.recognizeUsingWebSocket(config)
     }
 }
