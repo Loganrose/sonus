@@ -9,11 +9,19 @@ const ERROR = {
   INVALID_INDEX: "INVALID_INDEX"
 }
 
+const SILENCE_TIMEOUT = 6 // timeout in samples for sockets
+
 const CloudSpeechRecognizer = {}
 CloudSpeechRecognizer.init = recognizer => {
   const csr = new stream.Writable()
   csr.listening = false
   csr.recognizer = recognizer
+
+  // bind integration hooks
+  if (recognizer.finalEvent) csr.on('final-result', recognizer.finalEvent)
+  if (recognizer.partitalEvent) csr.on('partial-result', recognizer.partitalEvent)
+  if (recognizer.errorEvent) csr.on('error', recognizer.errorEvent)
+
   return csr
 }
 
@@ -25,6 +33,7 @@ CloudSpeechRecognizer.startStreaming = (options, audioStream, cloudSpeechRecogni
   let hasResults = false
   cloudSpeechRecognizer.listening = true
 
+  // ToDo: remove this in favor of cross-platform config
   const request = {
     config: {
       encoding: 'LINEAR16',
@@ -36,6 +45,15 @@ CloudSpeechRecognizer.startStreaming = (options, audioStream, cloudSpeechRecogni
     interimResults: true,
   }
 
+  const onSilence = () => (silent = true)
+  const onSound = () => {
+    if (silent) silent = false
+  }
+
+  let silent = false
+  cloudSpeechRecognizer.on('silence', onSilence)
+  cloudSpeechRecognizer.on('sound', onSound)
+
   const recognitionStream = cloudSpeechRecognizer.recognizer
     .streamingRecognize(request)
     .on('error', err => {
@@ -43,17 +61,19 @@ CloudSpeechRecognizer.startStreaming = (options, audioStream, cloudSpeechRecogni
       stopStream()
     })
     .on('data', data => {
-      if (data.results[0] && data.results[0].alternatives[0]) {
-        hasResults = true;
-        // Emit partial or final results and end the stream
+      const firstResult = (data.results) ? data.results[0] : null
+      if (firstResult && firstResult.alternatives[0]) {
+        hasResults = true
+        cloudSpeechRecognizer.emit('raw', data)
+        // Emit partial or final rcsresults and end the stream
         if (data.error) {
           cloudSpeechRecognizer.emit('error', data.error)
           stopStream()
-        } else if (data.results[0].isFinal) {
-          cloudSpeechRecognizer.emit('final-result', data.results[0].alternatives[0].transcript)
+        } else if (firstResult.isFinal || firstResult.final) {
+          cloudSpeechRecognizer.emit('final-result', firstResult.alternatives[0].transcript)
           stopStream()
         } else {
-          cloudSpeechRecognizer.emit('partial-result', data.results[0].alternatives[0].transcript)
+          cloudSpeechRecognizer.emit('partial-result', firstResult.alternatives[0].transcript)
         }
       } else {
         // Reached transcription time limit
@@ -64,13 +84,31 @@ CloudSpeechRecognizer.startStreaming = (options, audioStream, cloudSpeechRecogni
       }
     })
 
+  let silenceCount = 0
+
+  const socketEvent = data => {
+    if (silent) silenceCount++
+
+    if (silenceCount > SILENCE_TIMEOUT){
+      stopStream()
+      silenceCount = 0
+    } else recognitionStream.write(data)
+  }
+
   const stopStream = () => {
     cloudSpeechRecognizer.listening = false
-    audioStream.unpipe(recognitionStream)
+
+    if (cloudSpeechRecognizer.recognizer.isSocket) audioStream.removeListener('data', socketEvent)
+    else audioStream.unpipe(recognitionStream)
+
+    cloudSpeechRecognizer.removeListener('silence', onSilence)
+    cloudSpeechRecognizer.removeListener('sound', onSound)
+
     recognitionStream.end()
   }
 
-  audioStream.pipe(recognitionStream)
+  if (cloudSpeechRecognizer.recognizer.isSocket) audioStream.on('data', socketEvent)
+  else audioStream.pipe(recognitionStream)
 }
 
 const Sonus = {}
@@ -105,8 +143,14 @@ Sonus.init = (options, recognizer) => {
 
   const detector = sonus.detector = new Detector(opts)
 
-  detector.on('silence', () => sonus.emit('silence'))
-  detector.on('sound', () => sonus.emit('sound'))
+  detector.on('silence', () => {
+    csr.emit('silence')
+    sonus.emit('silence')
+  })
+  detector.on('sound', () => {
+    csr.emit('sound')
+    sonus.emit('sound')
+  })
 
   // When a hotword is detected pipe the audio stream to speech detection
   detector.on('hotword', (index, hotword) => {
@@ -120,6 +164,7 @@ Sonus.init = (options, recognizer) => {
     sonus.emit('final-result', transcript)
     Sonus.annyang.trigger(transcript)
   })
+  csr.on('raw', rawData => sonus.emit('raw', rawData))
 
   sonus.trigger = (index, hotword) => {
     if (sonus.started) {
